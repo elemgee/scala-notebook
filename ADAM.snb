@@ -1,0 +1,26 @@
+{
+  "metadata":{
+    "name":"ADAM",
+    "user_save_timestamp":"2014-12-03T21:57:40.121Z",
+    "auto_save_timestamp":"2014-11-22T07:59:41.090Z"
+  },
+  "worksheets":[{
+    "cells":[{
+      "cell_type":"code",
+      "input":"updateRepo(\"/tmp/scala-notebook/repo\")",
+      "language":"scala",
+      "collapsed":false,
+      "prompt_number":10,
+      "outputs":[]
+    },{
+      "cell_type":"code",
+      "input":":dp org.bdgenomics.adam % adam-apis % 0.15.0\n- org.apache.hadoop % hadoop-client %   _\n- org.apache.spark  %     _         %   _\n- org.scala-lang    %     _         %   _\n- org.scoverage     %     _         %   _",
+      "language":"scala",
+      "collapsed":false,
+      "prompt_number":16,
+      "outputs":[]
+    }]
+  }],
+  "autosaved":[],
+  "nbformat":3
+}

@@ -1,9 +1,19 @@
-package com.bwater.notebook
+package notebook
 package client
+
+import java.io.File
 
 import akka.actor.{ActorLogging, Props, Actor}
 import kernel._
-import java.io.File
+
+import org.sonatype.aether.repository.RemoteRepository
+
+import org.apache.spark.repl.HackSparkILoop
+
+import notebook.util.{Deps, Match, Repos}
+import notebook.front._
+import notebook.front.widgets._
+
 
 /**
  * Author: Ken
@@ -46,13 +56,102 @@ case class ObjectInfoResponse(found: Boolean, name: String, callDef: String, cal
  * @param compilerArgs Command line arguments to pass to the REPL compiler
  */
 class ReplCalculator(initScripts: List[String], compilerArgs: List[String]) extends Actor with akka.actor.ActorLogging {
-  private lazy val repl = new Repl(compilerArgs)
+  private var _repl:Option[Repl] = None
+
+  private def repl:Repl = _repl getOrElse {
+    val r = new Repl(compilerArgs, Nil)
+    _repl = Some(r)
+    r
+  }
+
+  var remotes:List[RemoteRepository] = List(Repos.central)
+
+  var repo:File = {
+    val tmp = new File(System.getProperty("java.io.tmpdir"))
+
+    val snb = new File(tmp, "scala-notebook")
+    if (!snb.exists) snb.mkdirs
+
+    val aether = new File(snb, "aether")
+    if (!aether.exists) aether.mkdirs
+
+    val r = new File(aether, java.util.UUID.randomUUID.toString)
+    if (!r.exists) r.mkdirs
+
+    r
+  }
+
+  private val repoRegex = "(?s)^:local-repo\\s*(.+)\\s*$".r
+  private val remoteRegex = "(?s)^:remote-repo\\s*(.+)\\s*$".r
+  private val cpRegex = "(?s)^:cp\\s*(.+)\\s*$".r
+  private val dpRegex = "(?s)^:dp\\s*(.+)\\s*$".r
+  private val sqlRegex = "(?s)^:sql(?:\\[([a-zA-Z0-9][a-zA-Z0-9]*)\\])?\\s*(.+)\\s*$".r
 
   // Make a child actor so we don't block the execution on the main thread, so that interruption can work
   private val executor = context.actorOf(Props(new Actor {
     def receive = {
       case ExecuteRequest(_, code) =>
-        val (result, _) = repl.evaluate(code, msg => sender ! StreamResponse(msg, "stdout"))
+        val (result, _) = {
+          val newCode =
+            code match {
+              case remoteRegex(r) =>
+                val List(id, name, url) = r.split("%").toList
+                remotes = (Repos(id,name,url)) :: remotes
+                s""" "Remote repo added: $r!" """
+
+              case repoRegex(r) =>
+                //TODO... probably copying the existing one would be better
+                repo = new File(r.trim)
+                repo.mkdirs
+                s""" "Repo changed to ${repo.getAbsolutePath}!" """
+
+              case dpRegex(cp) =>
+                val lines = cp.trim().split("\n").toList.map(_.trim()).filter(_.size > 0).toSet
+                val includes = lines map (Deps.parseInclude _) collect { case Some(x) => x }
+                val excludes = lines map (Deps.parseExclude _) collect { case Some(x) => x }
+                val excludesFns = excludes map (Deps.transitiveExclude _)
+
+                println(s"Includes: ${includes.mkString(" | ")}")
+                println(s"Excludes: ${excludes.mkString(" | ")}")
+                println(s"Remotes: ${remotes.mkString(" | ")}")
+                println(s"Local: ${repo}")
+
+                val jars = includes.flatMap(a => Deps.resolve(a, excludesFns)(remotes, repo)).toList
+
+                val (_r, replay) = repl.addCp(jars)
+                _repl = Some(_r)
+                preStartLogic()
+                replay()
+                s"""
+                  //updating jars
+                  jars = (${ jars.mkString("List(\"", "\",\"", "\")") } ::: jars.toList).distinct.toArray
+                  //restarting spark
+                  reset()
+                """
+
+              case cpRegex(cp) =>
+                val jars = cp.trim().split("\n").toList.map(_.trim()).filter(_.size > 0)
+                val (_r, replay) = repl.addCp(jars)
+                _repl = Some(_r)
+                preStartLogic()
+                replay()
+                s""" "Classpath changed!" """
+
+              case sqlRegex(n, sql) =>
+                log.debug(s"Received sql code: [$n] $sql")
+                val qs = "\"\"\""
+                //if (!sqlGen.parts.isEmpty) {
+                  val name = Option(n).map(nm => s"val $nm = ").getOrElse ("")
+                  val c = s"""
+                    import notebook.front.widgets.Sql
+                    import notebook.front.widgets.Sql._
+                    ${name}new Sql(sqlContext, s${qs}${sql}${qs})
+                  """
+                  c
+              case _ => code
+            }
+          repl.evaluate(newCode, msg => sender ! StreamResponse(msg, "stdout"))
+        }
 
         result match {
           case Success(result)     => sender ! ExecuteResponse(result.toString)
@@ -62,18 +161,38 @@ class ReplCalculator(initScripts: List[String], compilerArgs: List[String]) exte
     }
   }))
 
-  override def preStart() {
+  def preStartLogic() {
     log.info("ReplCalculator preStart")
-    for (script <- initScripts if (script.trim.length > 0)) {
-      val (result, _) = repl.evaluate(script)
-      result match {
-        case Failure(str) =>
-          log.error("Error in init script: \n%s".format(str))
-        case _ =>
-          if (log.isDebugEnabled) log.debug("\n" + script)
-          log.info("Init script processed successfully")
-      }
+
+    val dummyScript = () => s"""val dummy = ();\n"""
+    val SparkHookScript = () => s"""val _5C4L4_N0T3800K_5P4RK_HOOK = "${repl.classServerUri.get}";\n"""
+
+    def eval(script: () => String):Unit = {
+      val sc = script()
+      if (sc.trim.length > 0) {
+        val (result, _) = repl.evaluate(sc)
+        result match {
+          case Failure(str) =>
+            log.error("Error in init script: \n%s".format(str))
+          case _ =>
+            if (log.isDebugEnabled) log.debug("\n" + sc)
+            log.info("Init script processed successfully")
+        }
+      } else ()
     }
+
+    for (script <- (dummyScript :: SparkHookScript :: initScripts.map(x => () => x)) ) {
+
+      println(" INIT SCRIPT ")
+      println(script)
+
+
+      eval(script)
+    }
+  }
+
+  override def preStart() {
+    preStartLogic()
     super.preStart()
   }
 
